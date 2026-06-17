@@ -1,0 +1,31 @@
+services:
+  sales-analytics:
+    build: .
+    image: sales-analytics:latest
+    environment:
+      DATABASE_URL: sqlite:////app/data/sales_analytics.db
+      OUTPUT_DIR: /app/reports
+      LOCAL_DRIVE_DIR: /app/uploads
+      TOSS_CLIENT_MODE: mock
+      UPLOAD_MODE: local
+      SCHEDULER_POLL_SECONDS: 60
+      SCHEDULER_CLOSE_DELAY_MINUTES: 60
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./uploads:/app/uploads
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: sales_analytics
+      POSTGRES_USER: sales_analytics
+      POSTGRES_PASSWORD: sales_analytics
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

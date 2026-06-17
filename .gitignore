@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+secrets/
+*oauth_token*.json
+google_oauth_token.json
+
+# Runtime artifacts
+data/
+reports/
+uploads/
+.pytest_cache/
+.env

@@ -1,0 +1,26 @@
+[project]
+name = "sales-analytics"
+version = "0.1.0"
+description = "Daily POS sales analytics pipeline for Toss Place POS data."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "google-api-python-client>=2.197.0",
+    "google-auth>=2.55.0",
+    "google-auth-oauthlib>=1.4.0",
+    "httpx>=0.28.1",
+    "pandas>=3.0.3",
+    "psycopg[binary]>=3.3.4",
+    "python-dotenv>=1.2.2",
+    "sqlalchemy>=2.0.51",
+]
+
+[project.scripts]
+sales-analytics = "sales_analytics.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
