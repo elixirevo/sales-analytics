@@ -95,6 +95,10 @@ class HttpTossPlaceClient(TossPlaceClient):
                 last_error = TossPlaceApiError(f"Toss API retryable status {response.status_code}")
                 time.sleep(min(60, (2**attempt) + random.random()))
                 continue
+            if 400 <= response.status_code < 500:
+                raise TossPlaceApiError(
+                    f"Toss API client error {response.status_code}: {response.text[:500]}"
+                )
             response.raise_for_status()
             return response.json(), response.status_code, response.headers.get("x-toss-event-id")
         raise TossPlaceApiError(str(last_error) if last_error else "Toss API request failed")

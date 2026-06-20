@@ -15,6 +15,7 @@ from sales_analytics.config import MerchantConfig
 from sales_analytics.db import create_session_factory, init_database
 from sales_analytics.db.models import BatchRun, Order, Payment
 from sales_analytics.services.batch_service import BatchService
+from sales_analytics.services.bootstrap_discovery_service import discovery_start_date
 from sales_analytics.services.business_date_service import BusinessDateService
 from sales_analytics.services.csv_export_service import CsvExportService
 from sales_analytics.services.drive_upload_service import DriveUploadService
@@ -27,6 +28,8 @@ class SparseTossPlaceClient(MockTossPlaceClient):
         self.first_date = first_date
 
     def fetch_orders(self, merchant, business_date, start_at, end_at):
+        if start_at.date() != business_date or end_at.date() != business_date:
+            raise AssertionError("bootstrap discovery must probe one business day per API call")
         if start_at.date() <= self.first_date <= end_at.date():
             return self._page(merchant, self.first_date, start_at)
         if business_date >= self.first_date:
@@ -111,10 +114,14 @@ class PipelineTest(unittest.TestCase):
 
             self.assertEqual(dates[0], first_date)
             self.assertEqual(dates[-1], date.today() - timedelta(days=1))
-            self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*daily_*.csv"))), 8)
-            self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*weekly_*.csv"))), 4)
+            self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*daily_*.csv"))), 0)
+            self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*weekly_*.csv"))), 0)
             self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*monthly_*.csv"))), 4)
             self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*yearly_*.csv"))), 4)
+
+    def test_discovery_start_date_respects_toss_api_minimum(self) -> None:
+        self.assertEqual(discovery_start_date(date(2026, 6, 20), 5), date(2022, 1, 1))
+        self.assertEqual(discovery_start_date(date(2026, 6, 20), 1), date(2025, 6, 20))
 
 
 if __name__ == "__main__":

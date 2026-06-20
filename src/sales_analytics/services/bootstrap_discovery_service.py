@@ -7,6 +7,8 @@ from sales_analytics.clients.toss_place_client import TossPlaceClient
 from sales_analytics.config import MerchantConfig
 from sales_analytics.services.business_date_service import BusinessDateService
 
+TOSS_ORDER_MIN_DATE = date(2022, 1, 1)
+
 
 @dataclass(frozen=True)
 class TransactionProbe:
@@ -28,51 +30,55 @@ class BootstrapDiscoveryService:
         while current <= end:
             month_start = max(current, start)
             month_end = min(_next_month(current) - timedelta(days=1), end)
-            month_probe = self.probe_range(merchant, month_start, month_end)
-            print(
-                "bootstrap_discovery_month "
-                f"merchant_id={merchant.merchant_id} "
-                f"month={current:%Y-%m} "
-                f"orders={month_probe.orders_count} "
-                f"payments={month_probe.payments_count}",
-                flush=True,
-            )
-            if month_probe.has_transactions:
-                return self._find_first_day_in_month(merchant, month_start, month_end)
+            first_day = self._find_first_day_in_month(merchant, month_start, month_end)
+            if first_day is not None:
+                return first_day
             current = _next_month(current)
         return None
 
-    def probe_range(self, merchant: MerchantConfig, start: date, end: date) -> TransactionProbe:
-        start_at, _ = self.business_dates.calculate_range(merchant, start)
-        _, end_at = self.business_dates.calculate_range(merchant, end)
-        pages = self.client.fetch_orders(merchant, start, start_at, end_at)
+    def probe_day(self, merchant: MerchantConfig, business_date: date) -> TransactionProbe:
+        start_at, end_at = self.business_dates.calculate_range(merchant, business_date)
+        pages = self.client.fetch_orders(merchant, business_date, start_at, end_at)
         orders = [order for page in pages for order in page["orders"]]
         payments_count = sum(len(order.get("payments") or []) for order in orders)
         return TransactionProbe(orders_count=len(orders), payments_count=payments_count)
 
     def _find_first_day_in_month(self, merchant: MerchantConfig, start: date, end: date) -> date | None:
         current = start
+        month_orders = 0
+        month_payments = 0
         while current <= end:
-            day_probe = self.probe_range(merchant, current, current)
-            print(
-                "bootstrap_discovery_day "
-                f"merchant_id={merchant.merchant_id} "
-                f"business_date={current} "
-                f"orders={day_probe.orders_count} "
-                f"payments={day_probe.payments_count}",
-                flush=True,
-            )
+            day_probe = self.probe_day(merchant, current)
+            month_orders += day_probe.orders_count
+            month_payments += day_probe.payments_count
             if day_probe.has_transactions:
+                print(
+                    "bootstrap_discovery_day "
+                    f"merchant_id={merchant.merchant_id} "
+                    f"business_date={current} "
+                    f"orders={day_probe.orders_count} "
+                    f"payments={day_probe.payments_count}",
+                    flush=True,
+                )
                 return current
             current += timedelta(days=1)
+        print(
+            "bootstrap_discovery_month "
+            f"merchant_id={merchant.merchant_id} "
+            f"month={start:%Y-%m} "
+            f"orders={month_orders} "
+            f"payments={month_payments}",
+            flush=True,
+        )
         return None
 
 
 def discovery_start_date(end: date, lookback_years: int) -> date:
     try:
-        return end.replace(year=end.year - lookback_years)
+        requested = end.replace(year=end.year - lookback_years)
     except ValueError:
-        return end.replace(year=end.year - lookback_years, day=28)
+        requested = end.replace(year=end.year - lookback_years, day=28)
+    return max(requested, TOSS_ORDER_MIN_DATE)
 
 
 def _next_month(value: date) -> date:

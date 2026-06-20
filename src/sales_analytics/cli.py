@@ -90,12 +90,10 @@ def main() -> None:
         merchants = _select_merchants(settings.merchants, args.merchant_id)
         current = start
         while current <= end:
-            for merchant, result in _run_for_date(service, merchants, current):
-                if settings.aggregate_reports_enabled:
-                    _export_daily_report_for_result(service, merchant, result)
+            _run_for_date(service, merchants, current)
             current += timedelta(days=1)
         if settings.aggregate_reports_enabled:
-            _export_closing_period_reports_for_range(service, merchants, start, end)
+            _export_closing_period_reports_for_range(service, merchants, start, end, include_weekly=False)
         return
 
     if command == "check-toss-api":
@@ -250,8 +248,6 @@ def _run_bootstrap_backfill_for_range(
     failed = 0
     while current <= end:
         if service.has_successful_run(merchant.merchant_id, current):
-            if aggregate_reports_enabled:
-                _export_daily_report_for_date(service, merchant, current)
             skipped += 1
             current += timedelta(days=1)
             continue
@@ -280,8 +276,6 @@ def _run_bootstrap_backfill_for_range(
             f"uploaded_files={result.uploaded_files_count}",
             flush=True,
         )
-        if aggregate_reports_enabled:
-            _export_daily_report_for_result(service, merchant, result)
         current += timedelta(days=1)
     print(
         "bootstrap_backfill_finished "
@@ -292,7 +286,7 @@ def _run_bootstrap_backfill_for_range(
         flush=True,
     )
     if aggregate_reports_enabled:
-        _export_closing_period_reports_for_range(service, [merchant], start, end)
+        _export_closing_period_reports_for_range(service, [merchant], start, end, include_weekly=False)
 
 
 def _export_daily_report_for_result(service: BatchService, merchant: MerchantConfig, result) -> None:
@@ -334,12 +328,14 @@ def _export_closing_period_reports_for_range(
     merchants: list[MerchantConfig],
     start: date,
     end: date,
+    include_weekly: bool = True,
 ) -> None:
     for merchant in merchants:
-        for week_start in _week_starts(start, end):
-            week_end = min(week_start + timedelta(days=6), end)
-            if _has_successful_run_in_period(service, merchant.merchant_id, week_start, week_end):
-                _export_weekly_report(service, merchant, week_start)
+        if include_weekly:
+            for week_start in _week_starts(start, end):
+                week_end = min(week_start + timedelta(days=6), end)
+                if _has_successful_run_in_period(service, merchant.merchant_id, week_start, week_end):
+                    _export_weekly_report(service, merchant, week_start)
 
         for month_start in _month_starts(start, end):
             month_end = min(_next_month(month_start) - timedelta(days=1), end)
