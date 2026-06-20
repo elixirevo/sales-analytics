@@ -37,9 +37,13 @@ class Settings:
     google_oauth_client_secrets_file: str
     google_oauth_token_file: Path
     google_oauth_auto_auth: bool
-    scheduler_poll_seconds: int
     scheduler_close_delay_minutes: int
     scheduler_lookback_days: int
+    bootstrap_backfill_on_start: bool
+    bootstrap_discovery_enabled: bool
+    bootstrap_discovery_lookback_years: int
+    bootstrap_backfill_end_offset_days: int
+    aggregate_reports_enabled: bool
     merchants: tuple[MerchantConfig, ...]
 
 
@@ -76,8 +80,12 @@ def load_settings() -> Settings:
         google_oauth_client_secrets_file=os.getenv("GOOGLE_OAUTH_CLIENT_SECRETS_FILE", ""),
         google_oauth_token_file=Path(os.getenv("GOOGLE_OAUTH_TOKEN_FILE", "data/google_oauth_token.json")),
         google_oauth_auto_auth=os.getenv("GOOGLE_OAUTH_AUTO_AUTH", "true").lower() in {"1", "true", "yes", "on"},
-        scheduler_poll_seconds=int(os.getenv("SCHEDULER_POLL_SECONDS", "60")),
         scheduler_close_delay_minutes=int(os.getenv("SCHEDULER_CLOSE_DELAY_MINUTES", "60")),
         scheduler_lookback_days=int(os.getenv("SCHEDULER_LOOKBACK_DAYS", "2")),
+        bootstrap_backfill_on_start=os.getenv("BOOTSTRAP_BACKFILL_ON_START", "true").lower() in {"1", "true", "yes", "on"},
+        bootstrap_discovery_enabled=os.getenv("BOOTSTRAP_DISCOVERY_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+        bootstrap_discovery_lookback_years=int(os.getenv("BOOTSTRAP_DISCOVERY_LOOKBACK_YEARS", "5")),
+        bootstrap_backfill_end_offset_days=int(os.getenv("BOOTSTRAP_BACKFILL_END_OFFSET_DAYS", "1")),
+        aggregate_reports_enabled=os.getenv("AGGREGATE_REPORTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
         merchants=_load_merchants(os.getenv("MERCHANTS_JSON")),
     )

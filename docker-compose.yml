@@ -8,7 +8,6 @@ services:
       LOCAL_DRIVE_DIR: /app/uploads
       TOSS_CLIENT_MODE: mock
       UPLOAD_MODE: local
-      SCHEDULER_POLL_SECONDS: 60
       SCHEDULER_CLOSE_DELAY_MINUTES: 60
     volumes:
       - ./data:/app/data

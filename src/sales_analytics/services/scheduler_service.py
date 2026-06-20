@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as clock_time, timedelta
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from sales_analytics.config import MerchantConfig
@@ -11,28 +12,41 @@ from sales_analytics.services.batch_service import BatchResult, BatchService
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    poll_seconds: int = 60
     close_delay_minutes: int = 60
     lookback_days: int = 2
 
 
 class DailyBatchScheduler:
-    def __init__(self, batch_service: BatchService, merchants: list[MerchantConfig], config: SchedulerConfig):
+    def __init__(
+        self,
+        batch_service: BatchService,
+        merchants: list[MerchantConfig],
+        config: SchedulerConfig,
+        on_success: Callable[[MerchantConfig, BatchResult], None] | None = None,
+    ):
         self.batch_service = batch_service
         self.merchants = merchants
         self.config = config
+        self.on_success = on_success
 
     def run_forever(self) -> None:
         print(
             "scheduler_started "
             f"merchants={len(self.merchants)} "
-            f"poll_seconds={self.config.poll_seconds} "
-            f"close_delay_minutes={self.config.close_delay_minutes}",
+            f"close_delay_minutes={self.config.close_delay_minutes} "
+            f"lookback_days={self.config.lookback_days}",
             flush=True,
         )
         while True:
             self.run_due_once()
-            time.sleep(self.config.poll_seconds)
+            sleep_seconds, next_run_at = self._seconds_until_next_run()
+            print(
+                "scheduler_sleep "
+                f"next_run_at={next_run_at.isoformat()} "
+                f"sleep_seconds={sleep_seconds}",
+                flush=True,
+            )
+            time.sleep(sleep_seconds)
 
     def run_due_once(self) -> list[BatchResult]:
         results: list[BatchResult] = []
@@ -71,6 +85,17 @@ class DailyBatchScheduler:
                     f"uploaded_files={result.uploaded_files_count}",
                     flush=True,
                 )
+                if self.on_success is not None:
+                    try:
+                        self.on_success(merchant, result)
+                    except Exception as exc:
+                        print(
+                            "scheduler_post_success_failed "
+                            f"merchant_id={merchant.merchant_id} "
+                            f"business_date={business_date} "
+                            f"error={exc}",
+                            flush=True,
+                        )
         return results
 
     def _candidate_business_dates(self, merchant: MerchantConfig) -> list[date]:
@@ -89,3 +114,28 @@ class DailyBatchScheduler:
         close_day = business_date + timedelta(days=1) if close_time <= open_time else business_date
         close_at = datetime.combine(close_day, close_time, tzinfo=tz)
         return close_at + timedelta(minutes=self.config.close_delay_minutes)
+
+    def _seconds_until_next_run(self) -> tuple[int, datetime]:
+        candidates: list[datetime] = []
+        retry_needed = False
+        for merchant in self.merchants:
+            now = datetime.now(ZoneInfo(merchant.timezone))
+            today = now.date()
+            for offset in range(self.config.lookback_days, -2, -1):
+                business_date = today - timedelta(days=offset)
+                scheduled_at = self._scheduled_run_at(merchant, business_date)
+                if self.batch_service.has_successful_run(merchant.merchant_id, business_date):
+                    continue
+                if scheduled_at <= now:
+                    retry_needed = True
+                    continue
+                candidates.append(scheduled_at)
+        if retry_needed:
+            retry_at = datetime.now().astimezone() + timedelta(hours=1)
+            return 3600, retry_at
+        if not candidates:
+            fallback = datetime.now().astimezone() + timedelta(hours=1)
+            return 3600, fallback
+        next_run_at = min(candidates)
+        now_for_next = datetime.now(next_run_at.tzinfo)
+        return max(1, int((next_run_at - now_for_next).total_seconds())), next_run_at

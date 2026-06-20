@@ -31,6 +31,19 @@ class DriveClient:
     def target_folder_id(self, merchant: MerchantConfig, business_date: date) -> str | None:
         return None
 
+    def upload_period(
+        self,
+        merchant: MerchantConfig,
+        period_start: date,
+        period_type: str,
+        local_path: Path,
+        report_type: str,
+    ) -> UploadedFile:
+        return self.upload(merchant, period_start, local_path, report_type)
+
+    def target_period_folder_id(self, merchant: MerchantConfig, period_start: date, period_type: str) -> str | None:
+        return self.target_folder_id(merchant, period_start)
+
 
 class LocalDriveClient(DriveClient):
     def __init__(self, root: Path):
@@ -49,9 +62,49 @@ class LocalDriveClient(DriveClient):
         shutil.copy2(local_path, destination)
         return UploadedFile(drive_file_id=str(destination), drive_folder_id=str(folder))
 
+    def upload_period(
+        self,
+        merchant: MerchantConfig,
+        period_start: date,
+        period_type: str,
+        local_path: Path,
+        report_type: str,
+    ) -> UploadedFile:
+        folder = self._period_folder(merchant, period_start, period_type)
+        folder.mkdir(parents=True, exist_ok=True)
+        destination = folder / local_path.name
+        shutil.copy2(local_path, destination)
+        return UploadedFile(drive_file_id=str(destination), drive_folder_id=str(folder))
+
+    def target_period_folder_id(self, merchant: MerchantConfig, period_start: date, period_type: str) -> str:
+        return str(self._period_folder(merchant, period_start, period_type))
+
+    def _period_folder(self, merchant: MerchantConfig, period_start: date, period_type: str) -> Path:
+        base = self.root / f"merchant_{merchant.merchant_id}_{_safe_name(merchant.merchant_name)}" / f"{period_start:%Y}"
+        if period_type == "daily":
+            return base / f"{period_start:%m}" / period_start.isoformat()
+        if period_type == "weekly":
+            iso_year, iso_week, _ = period_start.isocalendar()
+            return self.root / f"merchant_{merchant.merchant_id}_{_safe_name(merchant.merchant_name)}" / f"{iso_year:04d}" / "weekly" / f"{iso_year:04d}-W{iso_week:02d}"
+        if period_type == "monthly":
+            return base / f"{period_start:%m}"
+        if period_type == "yearly":
+            return base
+        raise ValueError(f"Unsupported period_type={period_type}")
+
 
 class DisabledDriveClient(DriveClient):
     def upload(self, merchant: MerchantConfig, business_date: date, local_path: Path, report_type: str) -> UploadedFile:
+        return UploadedFile(drive_file_id=f"disabled:{local_path.name}", drive_folder_id="disabled")
+
+    def upload_period(
+        self,
+        merchant: MerchantConfig,
+        period_start: date,
+        period_type: str,
+        local_path: Path,
+        report_type: str,
+    ) -> UploadedFile:
         return UploadedFile(drive_file_id=f"disabled:{local_path.name}", drive_folder_id="disabled")
 
 
@@ -68,12 +121,49 @@ class GoogleDriveApiClient(DriveClient):
     def target_folder_id(self, merchant: MerchantConfig, business_date: date) -> str:
         return self._report_folder_id(merchant, business_date)
 
+    def upload_period(
+        self,
+        merchant: MerchantConfig,
+        period_start: date,
+        period_type: str,
+        local_path: Path,
+        report_type: str,
+    ) -> UploadedFile:
+        folder_id = self.target_period_folder_id(merchant, period_start, period_type)
+        if folder_id is None:
+            raise RuntimeError("Google Drive target period folder could not be resolved")
+        metadata = {"name": local_path.name, "parents": [folder_id]}
+        media = MediaFileUpload(str(local_path), mimetype="text/csv", resumable=local_path.stat().st_size > 5 * 1024 * 1024)
+        created = self.service.files().create(body=metadata, media_body=media, fields="id, parents").execute()
+        return UploadedFile(drive_file_id=created["id"], drive_folder_id=folder_id)
+
+    def target_period_folder_id(self, merchant: MerchantConfig, period_start: date, period_type: str) -> str:
+        return self._period_folder_id(merchant, period_start, period_type)
+
     def _report_folder_id(self, merchant: MerchantConfig, business_date: date) -> str:
         parent_id = merchant.drive_folder_id or "root"
         merchant_folder = self._ensure_folder(parent_id, f"merchant_{merchant.merchant_id}_{_safe_name(merchant.merchant_name)}")
         year_folder = self._ensure_folder(merchant_folder, f"{business_date:%Y}")
         month_folder = self._ensure_folder(year_folder, f"{business_date:%m}")
         return self._ensure_folder(month_folder, business_date.isoformat())
+
+    def _period_folder_id(self, merchant: MerchantConfig, period_start: date, period_type: str) -> str:
+        parent_id = merchant.drive_folder_id or "root"
+        merchant_folder = self._ensure_folder(parent_id, f"merchant_{merchant.merchant_id}_{_safe_name(merchant.merchant_name)}")
+        iso_year, iso_week, _ = period_start.isocalendar()
+        year_name = f"{iso_year:04d}" if period_type == "weekly" else f"{period_start:%Y}"
+        year_folder = self._ensure_folder(merchant_folder, year_name)
+        if period_type == "daily":
+            month_folder = self._ensure_folder(year_folder, f"{period_start:%m}")
+            return self._ensure_folder(month_folder, period_start.isoformat())
+        if period_type == "weekly":
+            weekly_folder = self._ensure_folder(year_folder, "weekly")
+            return self._ensure_folder(weekly_folder, f"{iso_year:04d}-W{iso_week:02d}")
+        if period_type == "monthly":
+            return self._ensure_folder(year_folder, f"{period_start:%m}")
+        if period_type == "yearly":
+            return year_folder
+        raise ValueError(f"Unsupported period_type={period_type}")
 
     def _ensure_folder(self, parent_id: str, name: str) -> str:
         escaped_name = name.replace("\\", "\\\\").replace("'", "\\'")

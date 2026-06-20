@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -139,20 +139,3 @@ class DriveUpload(Base):
     checksum: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, default="SUCCESS")
     uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
-
-
-class DataQualityWarning(Base):
-    __tablename__ = "data_quality_warnings"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    run_id: Mapped[str] = mapped_column(String(36), ForeignKey("batch_runs.run_id"))
-    merchant_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    business_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
-    warning_type: Mapped[str] = mapped_column(Text, nullable=False)
-    severity: Mapped[str] = mapped_column(Text, default="MEDIUM")
-    entity_id: Mapped[str | None] = mapped_column(Text)
-    metric_name: Mapped[str] = mapped_column(Text, nullable=False)
-    metric_value: Mapped[float] = mapped_column(Float, default=0)
-    baseline_value: Mapped[float | None] = mapped_column(Float)
-    message: Mapped[str] = mapped_column(Text, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)

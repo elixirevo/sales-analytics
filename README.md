@@ -44,7 +44,39 @@ sales-analytics backfill --from-date 2026-06-01 --to-date 2026-06-17
 
 ### 서버형 스케줄러
 
-컨테이너 기본 명령은 `serve`입니다. 프로세스가 계속 실행되면서 매장별 `business_close_time + SCHEDULER_CLOSE_DELAY_MINUTES`가 지난 영업일을 찾아 한 번씩 배치를 실행합니다.
+컨테이너 기본 명령은 `serve`입니다. 프로세스가 시작되면 기본적으로 최근 5년 범위를 월 단위로 스캔해 최초 거래일을 찾고, 그 날짜부터 어제 영업일까지 백필해 DB에 적재합니다. 이미 `SUCCESS`인 매장/영업일은 건너뛰므로 컨테이너 재시작 시 중복 수집하지 않습니다. 초기 백필이 끝난 뒤에는 프로세스가 계속 실행되면서 매장별 `business_close_time + SCHEDULER_CLOSE_DELAY_MINUTES`가 지난 영업일을 찾아 한 번씩 배치를 실행합니다.
+
+영업 종료 후 매일 실행되는 배치는 당일 주문/결제 데이터를 DB에 적재한 뒤, 분석 알림 없이 원본 기반 일별 CSV 4종을 `{drive_folder_id}/merchant_{merchant_id}_{merchant_name}/YYYY/MM/YYYY-MM-DD/`에 업로드합니다.
+
+일별 파일:
+
+- `daily_all_payments`: 일별 전체 결제 내역
+- `daily_order_details`: 일별 전체 주문 상세 내역
+- `daily_item_order_summary`: 일별 상품 주문 합계
+- `daily_payment_summary`: 일별 결제 합계
+
+매주 일요일 영업 종료 후에는 해당 ISO 주차의 주간 CSV와 해당 월의 월간 CSV를 갱신합니다.
+
+주간 파일은 `{drive_folder_id}/merchant_{merchant_id}_{merchant_name}/YYYY/weekly/YYYY-Www/`에 저장됩니다.
+
+- `weekly_all_payments`: 주별 전체 결제 내역
+- `weekly_order_details`: 주별 전체 주문 상세 내역
+- `weekly_item_order_summary`: 주별 상품 주문 합계
+- `weekly_payment_summary`: 주별 결제 합계
+
+월간 파일은 `{drive_folder_id}/merchant_{merchant_id}_{merchant_name}/YYYY/MM/`에 저장됩니다.
+
+- `monthly_all_payments`: 월별 전체 결제 내역
+- `monthly_order_details`: 월별 전체 주문 상세 내역
+- `monthly_item_order_summary`: 월별 상품 주문 합계
+- `monthly_payment_summary`: 월별 결제 합계
+
+매월 마지막 날 영업 종료 후에는 해당 연도의 연간 CSV를 갱신합니다. 연도 파일은 `{drive_folder_id}/merchant_{merchant_id}_{merchant_name}/YYYY/`에 저장됩니다.
+
+- `yearly_all_payments`: 연도별 전체 결제 내역
+- `yearly_order_details`: 연도별 전체 주문 상세 내역
+- `yearly_item_order_summary`: 연도별 상품 주문 합계
+- `yearly_payment_summary`: 연도별 결제 합계
 
 ```bash
 uv run sales-analytics serve
@@ -68,11 +100,21 @@ uv run sales-analytics serve --once
 
 스케줄 설정:
 
-- `SCHEDULER_POLL_SECONDS`: due 작업 확인 주기
 - `SCHEDULER_CLOSE_DELAY_MINUTES`: 영업 종료 후 지연 실행 시간
 - `SCHEDULER_LOOKBACK_DAYS`: 서버 재시작 시 놓친 과거 영업일 확인 범위
+- `BOOTSTRAP_BACKFILL_ON_START`: 서버 시작 시 최근 데이터 백필 여부. 기본 `true`
+- `BOOTSTRAP_DISCOVERY_ENABLED`: 첫 실행 시 최근 범위에서 최초 거래일 탐색 여부. 기본 `true`
+- `BOOTSTRAP_DISCOVERY_LOOKBACK_YEARS`: 최초 거래일 탐색 범위. 기본 `5`
+- `BOOTSTRAP_BACKFILL_END_OFFSET_DAYS`: 백필 종료일 offset. 기본 `1`이라 어제 영업일까지 백필
+- `AGGREGATE_REPORTS_ENABLED`: 원본 기반 일/주/월/연 CSV 생성 및 업로드 여부. 기본 `true`
 
-이미 `SUCCESS`인 매장/영업일은 서버 모드에서 다시 실행하지 않습니다. 재처리가 필요하면 `run --business-date` 또는 `backfill`을 사용합니다.
+초기 백필 없이 스케줄러만 확인하려면 다음처럼 실행합니다.
+
+```bash
+uv run sales-analytics serve --skip-bootstrap
+```
+
+재처리가 필요하면 `run --business-date` 또는 `backfill`을 사용합니다.
 
 ### 환경 변수
 
@@ -85,9 +127,13 @@ uv run sales-analytics serve --once
 - `GOOGLE_APPLICATION_CREDENTIALS`: `UPLOAD_MODE=google`일 때 서비스 계정 JSON 경로
 - `GOOGLE_OAUTH_CLIENT_SECRETS_FILE`: `auth-google` 최초 로그인에 사용할 OAuth 클라이언트 JSON 경로
 - `GOOGLE_OAUTH_TOKEN_FILE`: 개인 Google 계정 OAuth 토큰 저장 경로
-- `SCHEDULER_POLL_SECONDS`: 서버 모드 polling 주기
 - `SCHEDULER_CLOSE_DELAY_MINUTES`: 영업 종료 후 배치 실행 지연 시간
 - `SCHEDULER_LOOKBACK_DAYS`: 놓친 배치 확인 범위
+- `BOOTSTRAP_BACKFILL_ON_START`: 서버 시작 시 백필 실행 여부
+- `BOOTSTRAP_DISCOVERY_ENABLED`: 최근 범위에서 최초 거래일 자동 탐색 여부
+- `BOOTSTRAP_DISCOVERY_LOOKBACK_YEARS`: 최초 거래일 탐색 연수
+- `BOOTSTRAP_BACKFILL_END_OFFSET_DAYS`: 백필 종료일 offset
+- `AGGREGATE_REPORTS_ENABLED`: 원본 기반 일/주/월/연 리포트 저장 여부
 
 실제 Toss/Google 운영 credential은 코드나 Git에 두지 말고 Secret Manager 또는 런타임 secret으로 주입해야 합니다.
 

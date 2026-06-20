@@ -16,6 +16,9 @@ class TossPlaceApiError(RuntimeError):
 
 
 class TossPlaceClient:
+    def fetch_merchant(self, merchant: MerchantConfig) -> dict[str, Any]:
+        raise NotImplementedError
+
     def fetch_orders(
         self,
         merchant: MerchantConfig,
@@ -32,6 +35,11 @@ class HttpTossPlaceClient(TossPlaceClient):
             raise ValueError("TOSS_BASE_URL is required when TOSS_CLIENT_MODE=http")
         self.settings = settings
 
+    def fetch_merchant(self, merchant: MerchantConfig) -> dict[str, Any]:
+        body, _, _ = self._get(f"/merchants/{merchant.merchant_id}", {})
+        success = body.get("success")
+        return success if isinstance(success, dict) else body
+
     def fetch_orders(
         self,
         merchant: MerchantConfig,
@@ -43,7 +51,6 @@ class HttpTossPlaceClient(TossPlaceClient):
         page = 1
         while True:
             params = {
-                "merchantId": merchant.merchant_id,
                 "from": start_at.isoformat(),
                 "to": end_at.isoformat(),
                 "orderStates": "COMPLETED,CANCELLED",
@@ -51,11 +58,12 @@ class HttpTossPlaceClient(TossPlaceClient):
                 "size": self.settings.toss_page_size,
                 "sortOrder": "ASC",
             }
-            body, status, event_id = self._get("/orders", params)
+            path = f"/merchants/{merchant.merchant_id}/order/orders"
+            body, status, event_id = self._get(path, params)
             items = _extract_orders(body)
             pages.append(
                 {
-                    "endpoint": "/orders",
+                    "endpoint": path,
                     "request_params": params,
                     "response_body": body,
                     "http_status": status,
@@ -63,8 +71,9 @@ class HttpTossPlaceClient(TossPlaceClient):
                     "orders": items,
                 }
             )
-            has_next = body.get("hasNext")
-            total_pages = body.get("totalPages")
+            pager = _extract_pager(body)
+            has_next = pager.get("hasNext")
+            total_pages = pager.get("totalPages")
             if has_next is False or (total_pages and page >= int(total_pages)) or not items:
                 break
             page += 1
@@ -72,8 +81,9 @@ class HttpTossPlaceClient(TossPlaceClient):
 
     def _get(self, path: str, params: dict[str, Any]) -> tuple[dict[str, Any], int, str | None]:
         headers = {
-            "Authorization": f"Bearer {self.settings.toss_api_key}",
-            "X-Toss-Api-Secret": self.settings.toss_api_secret,
+            "x-access-key": self.settings.toss_api_key,
+            "x-secret-key": self.settings.toss_api_secret,
+            "Content-Type": "application/json",
         }
         last_error: Exception | None = None
         for attempt in range(1, self.settings.retry_max_attempts + 1):
@@ -91,6 +101,14 @@ class HttpTossPlaceClient(TossPlaceClient):
 
 
 class MockTossPlaceClient(TossPlaceClient):
+    def fetch_merchant(self, merchant: MerchantConfig) -> dict[str, Any]:
+        return {
+            "id": merchant.merchant_id,
+            "name": merchant.merchant_name,
+            "businessNumber": merchant.business_number,
+            "operatingHours": [],
+        }
+
     def fetch_orders(
         self,
         merchant: MerchantConfig,
@@ -209,8 +227,23 @@ def build_toss_client(settings: Settings) -> TossPlaceClient:
 
 
 def _extract_orders(body: dict[str, Any]) -> list[dict[str, Any]]:
+    success = body.get("success")
+    if isinstance(success, list):
+        return success
+    if isinstance(success, dict):
+        for key in ("orders", "content", "items", "data"):
+            value = success.get(key)
+            if isinstance(value, list):
+                return value
     for key in ("orders", "content", "items", "data"):
         value = body.get(key)
         if isinstance(value, list):
             return value
     return []
+
+
+def _extract_pager(body: dict[str, Any]) -> dict[str, Any]:
+    success = body.get("success")
+    if isinstance(success, dict):
+        return success
+    return body

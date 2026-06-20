@@ -2,15 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from math import isnan
 
-from sqlalchemy import delete
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from sales_analytics.config import MerchantConfig
-from sales_analytics.db.models import BatchRun, DataQualityWarning, Merchant, Order, Payment
-from sales_analytics.services.analytics_service import AnalyticsService
+from sales_analytics.db.models import BatchRun, Merchant, Order, Payment
 from sales_analytics.services.csv_export_service import CsvExportService
 from sales_analytics.services.drive_upload_service import DriveUploadService
 from sales_analytics.services.ingestion_service import IngestionService
@@ -35,14 +32,12 @@ class BatchService:
         session_factory: sessionmaker[Session],
         ingestion: IngestionService,
         normalization: NormalizationService,
-        analytics: AnalyticsService,
         csv_export: CsvExportService,
         drive_upload: DriveUploadService,
     ):
         self.session_factory = session_factory
         self.ingestion = ingestion
         self.normalization = normalization
-        self.analytics = analytics
         self.csv_export = csv_export
         self.drive_upload = drive_upload
 
@@ -61,18 +56,11 @@ class BatchService:
                 session.commit()
                 orders_count, payments_count = self._count_normalized_rows(session, merchant.merchant_id, business_date)
 
-                analytics_result = self.analytics.build_reports(session, merchant.merchant_id, business_date)
-                self._replace_quality_warnings(
-                    session, run.run_id, merchant.merchant_id, business_date, analytics_result.quality_warnings
-                )
-                exported = self.csv_export.export(merchant, business_date, analytics_result.frames)
-                uploaded_count = self.drive_upload.upload_files(session, run.run_id, merchant, business_date, exported)
-
                 run.status = "SUCCESS"
                 run.orders_count = orders_count
                 run.payments_count = payments_count
-                run.csv_files_count = len(exported)
-                run.drive_upload_status = "SUCCESS" if uploaded_count == len(exported) else "PARTIAL_SUCCESS"
+                run.csv_files_count = 0
+                run.drive_upload_status = "SKIPPED"
                 run.finished_at = _now()
                 session.commit()
                 return BatchResult(
@@ -82,8 +70,8 @@ class BatchService:
                     status=run.status,
                     orders_count=orders_count,
                     payments_count=payments_count,
-                    csv_files_count=len(exported),
-                    uploaded_files_count=uploaded_count,
+                    csv_files_count=0,
+                    uploaded_files_count=0,
                 )
             except Exception as exc:
                 session.rollback()
@@ -116,27 +104,6 @@ class BatchService:
         row.drive_folder_id = merchant.drive_folder_id
         row.is_active = merchant.is_active
         session.merge(row)
-
-    def _replace_quality_warnings(self, session: Session, run_id: str, merchant_id: int, business_date: date, warnings) -> None:
-        session.execute(delete(DataQualityWarning).where(DataQualityWarning.run_id == run_id))
-        if warnings.empty:
-            return
-        for row in warnings.to_dict("records"):
-            baseline = row.get("baseline_value")
-            session.add(
-                DataQualityWarning(
-                    run_id=run_id,
-                    merchant_id=merchant_id,
-                    business_date=business_date,
-                    warning_type=row["warning_type"],
-                    severity=row["severity"],
-                    entity_id=row.get("entity_id"),
-                    metric_name=row["metric_name"],
-                    metric_value=float(row["metric_value"]),
-                    baseline_value=None if baseline is None or (isinstance(baseline, float) and isnan(baseline)) else float(baseline),
-                    message=row["message"],
-                )
-            )
 
     def _count_normalized_rows(self, session: Session, merchant_id: int, business_date: date) -> tuple[int, int]:
         orders = session.scalar(
