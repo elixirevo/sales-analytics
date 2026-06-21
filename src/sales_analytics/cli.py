@@ -200,6 +200,28 @@ def _run_discovered_bootstrap_backfill(
         today = datetime.now(ZoneInfo(merchant.timezone)).date()
         end = today - timedelta(days=end_offset_days)
         start = discovery_start_date(end, lookback_years)
+        latest_successful_date = _latest_successful_business_date(service, merchant.merchant_id)
+        if latest_successful_date is not None:
+            if latest_successful_date >= end:
+                print(
+                    "bootstrap_backfill_already_current "
+                    f"merchant_id={merchant.merchant_id} "
+                    f"latest_successful_business_date={latest_successful_date} "
+                    f"to_date={end}",
+                    flush=True,
+                )
+                continue
+            resume_start = max(start, latest_successful_date + timedelta(days=1))
+            print(
+                "bootstrap_backfill_resume "
+                f"merchant_id={merchant.merchant_id} "
+                f"latest_successful_business_date={latest_successful_date} "
+                f"from_date={resume_start} "
+                f"to_date={end}",
+                flush=True,
+            )
+            _run_bootstrap_backfill_for_range(service, merchant, resume_start, end, aggregate_reports_enabled)
+            continue
         print(
             "bootstrap_discovery_started "
             f"merchant_id={merchant.merchant_id} "
@@ -285,7 +307,7 @@ def _run_bootstrap_backfill_for_range(
         f"failed={failed}",
         flush=True,
     )
-    if aggregate_reports_enabled:
+    if aggregate_reports_enabled and completed > 0:
         _export_closing_period_reports_for_range(service, [merchant], start, end, include_weekly=False)
 
 
@@ -439,6 +461,16 @@ def _latest_successful_run_id(service: BatchService, merchant_id: int, start: da
             )
             .order_by(BatchRun.finished_at.desc(), BatchRun.started_at.desc())
             .limit(1)
+        )
+
+
+def _latest_successful_business_date(service: BatchService, merchant_id: int) -> date | None:
+    with service.session_factory() as session:
+        return session.scalar(
+            select(func.max(BatchRun.business_date)).where(
+                BatchRun.merchant_id == merchant_id,
+                BatchRun.status == "SUCCESS",
+            )
         )
 
 

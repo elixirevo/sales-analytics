@@ -26,8 +26,10 @@ from sales_analytics.services.normalization_service import NormalizationService
 class SparseTossPlaceClient(MockTossPlaceClient):
     def __init__(self, first_date: date):
         self.first_date = first_date
+        self.fetch_orders_calls = 0
 
     def fetch_orders(self, merchant, business_date, start_at, end_at):
+        self.fetch_orders_calls += 1
         if start_at.date() != business_date or end_at.date() != business_date:
             raise AssertionError("bootstrap discovery must probe one business day per API call")
         if start_at.date() <= self.first_date <= end_at.date():
@@ -118,6 +120,32 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*weekly_*.csv"))), 0)
             self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*monthly_*.csv"))), 4)
             self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*yearly_*.csv"))), 4)
+
+    def test_discovered_bootstrap_skips_api_and_uploads_when_db_is_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{root / 'sales.db'}"
+            init_database(database_url)
+            factory = create_session_factory(database_url)
+            merchant = MerchantConfig(merchant_id=1, merchant_name="Demo Store")
+            first_date = date.today() - timedelta(days=2)
+            client = SparseTossPlaceClient(first_date)
+            service = BatchService(
+                session_factory=factory,
+                ingestion=IngestionService(client, BusinessDateService()),
+                normalization=NormalizationService(),
+                csv_export=CsvExportService(root / "reports"),
+                drive_upload=DriveUploadService(LocalDriveClient(root / "uploads")),
+            )
+
+            _run_discovered_bootstrap_backfill(service, [merchant], lookback_years=1, end_offset_days=1)
+            calls_after_first_run = client.fetch_orders_calls
+            uploads_after_first_run = len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*.csv")))
+
+            _run_discovered_bootstrap_backfill(service, [merchant], lookback_years=1, end_offset_days=1)
+
+            self.assertEqual(client.fetch_orders_calls, calls_after_first_run)
+            self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*.csv"))), uploads_after_first_run)
 
     def test_discovery_start_date_respects_toss_api_minimum(self) -> None:
         self.assertEqual(discovery_start_date(date(2026, 6, 20), 5), date(2022, 1, 1))
