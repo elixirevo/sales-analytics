@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import select
@@ -13,7 +13,7 @@ from sales_analytics.clients.google_drive_client import LocalDriveClient
 from sales_analytics.clients.toss_place_client import MockTossPlaceClient
 from sales_analytics.config import MerchantConfig
 from sales_analytics.db import create_session_factory, init_database
-from sales_analytics.db.models import BatchRun, Order, Payment
+from sales_analytics.db.models import BatchRun, Merchant, Order, OrderLineItem, Payment
 from sales_analytics.services.batch_service import BatchService
 from sales_analytics.services.bootstrap_discovery_service import discovery_start_date
 from sales_analytics.services.business_date_service import BusinessDateService
@@ -21,6 +21,7 @@ from sales_analytics.services.csv_export_service import CsvExportService
 from sales_analytics.services.drive_upload_service import DriveUploadService
 from sales_analytics.services.ingestion_service import IngestionService
 from sales_analytics.services.normalization_service import NormalizationService
+from sales_analytics.services.periodic_report_service import PeriodicReportService
 
 
 class SparseTossPlaceClient(MockTossPlaceClient):
@@ -150,6 +151,66 @@ class PipelineTest(unittest.TestCase):
     def test_discovery_start_date_respects_toss_api_minimum(self) -> None:
         self.assertEqual(discovery_start_date(date(2026, 6, 20), 5), date(2022, 1, 1))
         self.assertEqual(discovery_start_date(date(2026, 6, 20), 1), date(2025, 6, 20))
+
+    def test_periodic_reports_render_timestamps_in_merchant_timezone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{root / 'sales.db'}"
+            init_database(database_url)
+            factory = create_session_factory(database_url)
+            with factory() as session:
+                session.add(
+                    Merchant(
+                        merchant_id=1,
+                        merchant_name="Demo Store",
+                        timezone="Asia/Seoul",
+                    )
+                )
+                session.add(
+                    Order(
+                        order_id="order-1",
+                        merchant_id=1,
+                        business_date=date(2025, 7, 1),
+                        order_state="COMPLETED",
+                        created_at=datetime(2025, 7, 1, 0, 5, 16),
+                        completed_at=datetime(2025, 7, 1, 0, 5, 17),
+                        total_amount=5700,
+                    )
+                )
+                session.add(
+                    OrderLineItem(
+                        order_id="order-1",
+                        merchant_id=1,
+                        business_date=date(2025, 7, 1),
+                        item_title="Bread",
+                        category_title="Bakery",
+                        quantity=1,
+                        unit_price=5700,
+                        line_total_amount=5700,
+                    )
+                )
+                session.add(
+                    Payment(
+                        payment_id="payment-1",
+                        order_id="order-1",
+                        merchant_id=1,
+                        business_date=date(2025, 7, 1),
+                        state="APPROVED",
+                        payment_method="CARD",
+                        amount=5700,
+                        approved_at=datetime(2025, 7, 1, 0, 5, 17),
+                        created_at=datetime(2025, 7, 1, 0, 5, 16),
+                    )
+                )
+                session.commit()
+
+                reports = PeriodicReportService().build_monthly_reports(session, 1, 2025, 7)
+
+            order_row = reports.frames["monthly_order_details"].iloc[0]
+            payment_row = reports.frames["monthly_all_payments"].iloc[0]
+            self.assertEqual(order_row["created_at"], "2025-07-01 09:05:16")
+            self.assertEqual(order_row["completed_at"], "2025-07-01 09:05:17")
+            self.assertEqual(payment_row["approved_at"], "2025-07-01 09:05:17")
 
 
 if __name__ == "__main__":

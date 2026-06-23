@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sqlalchemy import text
@@ -44,8 +45,9 @@ class PeriodicReportService:
         period_label: str,
         period_type: str,
     ) -> PeriodicReports:
-        payments = self._read_payments(session, merchant_id, start, end_exclusive)
-        details = self._read_order_details(session, merchant_id, start, end_exclusive)
+        timezone = self._merchant_timezone(session, merchant_id)
+        payments = _format_timestamp_columns(self._read_payments(session, merchant_id, start, end_exclusive), timezone)
+        details = _format_timestamp_columns(self._read_order_details(session, merchant_id, start, end_exclusive), timezone)
         frames = {
             f"{period_type}_all_payments": self._with_period(payments, period_type, period_label),
             f"{period_type}_order_details": self._with_period(details, period_type, period_label),
@@ -190,9 +192,23 @@ class PeriodicReportService:
         result["share"] = result["approved_amount"].apply(lambda value: _safe_div(value, total))
         return result[columns]
 
+    def _merchant_timezone(self, session: Session, merchant_id: int) -> ZoneInfo:
+        timezone_name = session.scalar(
+            text("select timezone from merchants where merchant_id = :merchant_id"),
+            {"merchant_id": merchant_id},
+        )
+        return ZoneInfo(timezone_name or "Asia/Seoul")
+
 
 COMPLETED_STATES = {"COMPLETED", "DONE", "APPROVED", "PAID"}
 CANCELLED_TOKEN = "CANCEL"
+TIMESTAMP_COLUMNS = {
+    "approved_at",
+    "cancelled_at",
+    "created_at",
+    "updated_at",
+    "completed_at",
+}
 
 
 def _is_completed(series: pd.Series) -> pd.Series:
@@ -205,3 +221,14 @@ def _is_cancelled(series: pd.Series) -> pd.Series:
 
 def _safe_div(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator else 0.0
+
+
+def _format_timestamp_columns(frame: pd.DataFrame, timezone: ZoneInfo) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    result = frame.copy()
+    for column in TIMESTAMP_COLUMNS.intersection(result.columns):
+        values = pd.to_datetime(result[column], errors="coerce", utc=True).dt.tz_convert(timezone)
+        result[column] = values.dt.strftime("%Y-%m-%d %H:%M:%S")
+        result.loc[values.isna(), column] = ""
+    return result
