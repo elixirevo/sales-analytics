@@ -87,8 +87,13 @@ class HttpTossPlaceClient(TossPlaceClient):
         }
         last_error: Exception | None = None
         for attempt in range(1, self.settings.retry_max_attempts + 1):
-            with httpx.Client(timeout=30) as client:
-                response = client.get(f"{self.settings.toss_base_url}{path}", params=params, headers=headers)
+            try:
+                with httpx.Client(timeout=30) as client:
+                    response = client.get(f"{self.settings.toss_base_url}{path}", params=params, headers=headers)
+            except httpx.HTTPError as exc:
+                last_error = TossPlaceApiError(f"Toss API request error: {exc}")
+                time.sleep(min(60, (2**attempt) + random.random()))
+                continue
             if response.status_code == 401:
                 raise TossPlaceApiError("Toss API authentication failed with HTTP 401")
             if response.status_code == 429 or 500 <= response.status_code < 600:

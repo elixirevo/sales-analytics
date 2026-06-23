@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from sqlalchemy import select
@@ -28,11 +28,29 @@ class SparseTossPlaceClient(MockTossPlaceClient):
     def __init__(self, first_date: date):
         self.first_date = first_date
         self.fetch_orders_calls = 0
+        self.range_fetch_orders_calls = 0
 
     def fetch_orders(self, merchant, business_date, start_at, end_at):
         self.fetch_orders_calls += 1
-        if start_at.date() != business_date or end_at.date() != business_date:
-            raise AssertionError("bootstrap discovery must probe one business day per API call")
+        if start_at.date() != end_at.date():
+            self.range_fetch_orders_calls += 1
+            orders = []
+            current = max(business_date, self.first_date)
+            end_date = end_at.date()
+            while current <= end_date:
+                day_start = datetime.combine(current, time.fromisoformat(merchant.business_open_time), tzinfo=start_at.tzinfo)
+                orders.extend(self._build_orders(merchant, current, day_start))
+                current += timedelta(days=1)
+            return [
+                {
+                    "endpoint": "/mock/orders",
+                    "request_params": {"from": start_at.isoformat(), "to": end_at.isoformat()},
+                    "response_body": {"orders": orders, "page": 1, "size": len(orders), "hasNext": False},
+                    "http_status": 200,
+                    "x_toss_event_id": f"mock-range-{business_date}",
+                    "orders": orders,
+                }
+            ]
         if start_at.date() <= self.first_date <= end_at.date():
             return self._page(merchant, self.first_date, start_at)
         if business_date >= self.first_date:
@@ -121,6 +139,27 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*weekly_*.csv"))), 0)
             self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*monthly_*.csv"))), 4)
             self.assertEqual(len(list((root / "uploads" / "merchant_1_Demo_Store").glob("**/*yearly_*.csv"))), 4)
+
+    def test_bootstrap_backfill_uses_range_fetch_after_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{root / 'sales.db'}"
+            init_database(database_url)
+            factory = create_session_factory(database_url)
+            merchant = MerchantConfig(merchant_id=1, merchant_name="Demo Store")
+            first_date = date.today() - timedelta(days=2)
+            client = SparseTossPlaceClient(first_date)
+            service = BatchService(
+                session_factory=factory,
+                ingestion=IngestionService(client, BusinessDateService()),
+                normalization=NormalizationService(),
+                csv_export=CsvExportService(root / "reports"),
+                drive_upload=DriveUploadService(LocalDriveClient(root / "uploads")),
+            )
+
+            _run_discovered_bootstrap_backfill(service, [merchant], lookback_years=1, end_offset_days=1)
+
+            self.assertGreaterEqual(client.range_fetch_orders_calls, 1)
 
     def test_discovered_bootstrap_skips_api_and_uploads_when_db_is_current(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

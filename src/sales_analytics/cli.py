@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 
 from sales_analytics.clients.google_drive_client import build_drive_client, create_oauth_token
+from sales_analytics.clients.toss_place_client import TossPlaceApiError
 from sales_analytics.clients.toss_place_client import build_toss_client
 from sales_analytics.config import MerchantConfig, load_settings
 from sales_analytics.db.models import BatchRun
@@ -264,14 +265,114 @@ def _run_bootstrap_backfill_for_range(
         f"days={(end - start).days + 1}",
         flush=True,
     )
-    current = start
     completed = 0
     skipped = 0
     failed = 0
-    while current <= end:
+    for month_start in _month_starts(start, end):
+        month_end = min(_next_month(month_start) - timedelta(days=1), end)
+        month_start = max(month_start, start)
+        month_completed, month_skipped, month_failed = _run_bootstrap_month_or_daily(
+            service, merchant, month_start, month_end
+        )
+        completed += month_completed
+        skipped += month_skipped
+        failed += month_failed
+    print(
+        "bootstrap_backfill_finished "
+        f"merchant_id={merchant.merchant_id} "
+        f"completed={completed} "
+        f"skipped={skipped} "
+        f"failed={failed}",
+        flush=True,
+    )
+    if aggregate_reports_enabled and completed > 0:
+        _export_closing_period_reports_for_range(service, [merchant], start, end, include_weekly=False)
+
+
+def _run_bootstrap_month_or_daily(
+    service: BatchService,
+    merchant: MerchantConfig,
+    start: date,
+    end: date,
+) -> tuple[int, int, int]:
+    pending_dates = [current for current in _date_range(start, end) if not service.has_successful_run(merchant.merchant_id, current)]
+    skipped = (end - start).days + 1 - len(pending_dates)
+    if not pending_dates:
+        return 0, skipped, 0
+    try:
+        return _run_bootstrap_month_range(service, merchant, min(pending_dates), max(pending_dates), pending_dates, skipped)
+    except TossPlaceApiError as exc:
+        print(
+            "bootstrap_backfill_month_fallback "
+            f"merchant_id={merchant.merchant_id} "
+            f"from_date={start} "
+            f"to_date={end} "
+            f"error={exc}",
+            flush=True,
+        )
+        return _run_bootstrap_daily_range(service, merchant, start, end)
+
+
+def _run_bootstrap_month_range(
+    service: BatchService,
+    merchant: MerchantConfig,
+    start: date,
+    end: date,
+    pending_dates: list[date],
+    skipped: int,
+) -> tuple[int, int, int]:
+    start_at, _ = service.ingestion.business_dates.calculate_range(merchant, start)
+    _, end_at = service.ingestion.business_dates.calculate_range(merchant, end)
+    with service.session_factory() as session:
+        service._upsert_merchant(session, merchant)
+        grouped_orders = service.ingestion.ingest_range(session, merchant, start, end, start_at, end_at)
+        completed = 0
+        for business_date in pending_dates:
+            run = BatchRun(merchant_id=merchant.merchant_id, business_date=business_date)
+            session.add(run)
+            session.flush()
+            try:
+                service.normalization.normalize_orders(
+                    session,
+                    merchant.merchant_id,
+                    business_date,
+                    grouped_orders.get(business_date, []),
+                )
+                orders_count, payments_count = service._count_normalized_rows(session, merchant.merchant_id, business_date)
+                run.status = "SUCCESS"
+                run.orders_count = orders_count
+                run.payments_count = payments_count
+                run.csv_files_count = 0
+                run.drive_upload_status = "SKIPPED"
+                run.finished_at = datetime.now(ZoneInfo("UTC")).replace(tzinfo=None)
+                completed += 1
+                print(
+                    "bootstrap_backfill_success "
+                    f"run_id={run.run_id} "
+                    f"merchant_id={merchant.merchant_id} "
+                    f"business_date={business_date} "
+                    f"orders={orders_count} "
+                    f"payments={payments_count} "
+                    f"csv_files=0 "
+                    f"uploaded_files=0",
+                    flush=True,
+                )
+            except Exception as exc:
+                run.status = "FAILED"
+                run.error_message = str(exc)
+                run.finished_at = datetime.now(ZoneInfo("UTC")).replace(tzinfo=None)
+                raise
+        session.commit()
+    return completed, skipped, 0
+
+
+def _run_bootstrap_daily_range(service: BatchService, merchant: MerchantConfig, start: date, end: date) -> tuple[int, int, int]:
+    completed = 0
+    skipped = 0
+    failed = 0
+    for current in _date_range(start, end):
         if service.has_successful_run(merchant.merchant_id, current):
             skipped += 1
-            current += timedelta(days=1)
             continue
         try:
             result = service.run_for_merchant(merchant, current)
@@ -284,7 +385,6 @@ def _run_bootstrap_backfill_for_range(
                 f"error={exc}",
                 flush=True,
             )
-            current += timedelta(days=1)
             continue
         completed += 1
         print(
@@ -298,17 +398,7 @@ def _run_bootstrap_backfill_for_range(
             f"uploaded_files={result.uploaded_files_count}",
             flush=True,
         )
-        current += timedelta(days=1)
-    print(
-        "bootstrap_backfill_finished "
-        f"merchant_id={merchant.merchant_id} "
-        f"completed={completed} "
-        f"skipped={skipped} "
-        f"failed={failed}",
-        flush=True,
-    )
-    if aggregate_reports_enabled and completed > 0:
-        _export_closing_period_reports_for_range(service, [merchant], start, end, include_weekly=False)
+    return completed, skipped, failed
 
 
 def _export_daily_report_for_result(service: BatchService, merchant: MerchantConfig, result) -> None:
@@ -494,6 +584,15 @@ def _week_starts(start: date, end: date) -> list[date]:
 
 def _week_start(value: date) -> date:
     return value - timedelta(days=value.weekday())
+
+
+def _date_range(start: date, end: date) -> list[date]:
+    current = start
+    result = []
+    while current <= end:
+        result.append(current)
+        current += timedelta(days=1)
+    return result
 
 
 def _year_starts(start: date, end: date) -> list[date]:
