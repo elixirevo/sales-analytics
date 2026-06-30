@@ -26,17 +26,21 @@ class DriveUploadService:
         uploaded_count = 0
         for file in files:
             target_folder_id = self.client.target_folder_id(merchant, business_date)
-            existing = session.scalar(
-                select(DriveUpload).where(
-                    DriveUpload.merchant_id == merchant.merchant_id,
-                    DriveUpload.business_date == business_date,
-                    DriveUpload.report_type == file.report_type,
-                    DriveUpload.checksum == file.checksum,
-                )
+            existing = _find_existing_upload(
+                session,
+                merchant.merchant_id,
+                business_date,
+                file.report_type,
+                file.path.name,
+                file.checksum,
+                target_folder_id,
             )
             if existing and _is_remote_upload(existing.drive_file_id) and (
                 target_folder_id is None or existing.drive_folder_id == target_folder_id
-            ):
+            ) and existing.checksum == file.checksum:
+                uploaded_count += 1
+                continue
+            if existing and not _is_remote_upload(existing.drive_file_id) and existing.checksum == file.checksum:
                 uploaded_count += 1
                 continue
             upload = self.client.upload(merchant, business_date, file.path, file.report_type)
@@ -82,17 +86,21 @@ class DriveUploadService:
         uploaded_count = 0
         for file in files:
             target_folder_id = self.client.target_period_folder_id(merchant, period_start, period_type)
-            existing = session.scalar(
-                select(DriveUpload).where(
-                    DriveUpload.merchant_id == merchant.merchant_id,
-                    DriveUpload.business_date == period_start,
-                    DriveUpload.report_type == file.report_type,
-                    DriveUpload.checksum == file.checksum,
-                )
+            existing = _find_existing_upload(
+                session,
+                merchant.merchant_id,
+                period_start,
+                file.report_type,
+                file.path.name,
+                file.checksum,
+                target_folder_id,
             )
             if existing and _is_remote_upload(existing.drive_file_id) and (
                 target_folder_id is None or existing.drive_folder_id == target_folder_id
-            ):
+            ) and existing.checksum == file.checksum:
+                uploaded_count += 1
+                continue
+            if existing and not _is_remote_upload(existing.drive_file_id) and existing.checksum == file.checksum:
                 uploaded_count += 1
                 continue
             upload = self.client.upload_period(merchant, period_start, period_type, file.path, file.report_type)
@@ -125,6 +133,38 @@ class DriveUploadService:
             session.flush()
             uploaded_count += 1
         return uploaded_count
+
+
+def _find_existing_upload(
+    session: Session,
+    merchant_id: int,
+    business_date: date,
+    report_type: str,
+    file_name: str,
+    checksum: str,
+    target_folder_id: str | None,
+) -> DriveUpload | None:
+    checksum_matches = [
+        DriveUpload.merchant_id == merchant_id,
+        DriveUpload.business_date == business_date,
+        DriveUpload.report_type == report_type,
+        DriveUpload.checksum == checksum,
+    ]
+    if target_folder_id is not None:
+        checksum_matches.append(DriveUpload.drive_folder_id == target_folder_id)
+    existing = session.scalar(select(DriveUpload).where(*checksum_matches).order_by(DriveUpload.uploaded_at.desc()).limit(1))
+    if existing:
+        return existing
+
+    file_matches = [
+        DriveUpload.merchant_id == merchant_id,
+        DriveUpload.business_date == business_date,
+        DriveUpload.report_type == report_type,
+        DriveUpload.file_name == file_name,
+    ]
+    if target_folder_id is not None:
+        file_matches.append(DriveUpload.drive_folder_id == target_folder_id)
+    return session.scalar(select(DriveUpload).where(*file_matches).order_by(DriveUpload.uploaded_at.desc()).limit(1))
 
 
 def _is_remote_upload(drive_file_id: str) -> bool:

@@ -5,19 +5,21 @@ import tempfile
 import unittest
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
+from google.auth.exceptions import RefreshError
 from sqlalchemy import select
 
 from sales_analytics.cli import _run_discovered_bootstrap_backfill
-from sales_analytics.clients.google_drive_client import LocalDriveClient
+from sales_analytics.clients.google_drive_client import DriveClient, GoogleDriveApiClient, LocalDriveClient, UploadedFile, load_oauth_credentials
 from sales_analytics.clients.toss_place_client import MockTossPlaceClient
 from sales_analytics.config import MerchantConfig
 from sales_analytics.db import create_session_factory, init_database
-from sales_analytics.db.models import BatchRun, Merchant, Order, OrderLineItem, Payment
+from sales_analytics.db.models import BatchRun, DriveUpload, Merchant, Order, OrderLineItem, Payment
 from sales_analytics.services.batch_service import BatchService
 from sales_analytics.services.bootstrap_discovery_service import discovery_start_date
 from sales_analytics.services.business_date_service import BusinessDateService
-from sales_analytics.services.csv_export_service import CsvExportService
+from sales_analytics.services.csv_export_service import CsvExportService, ExportedFile
 from sales_analytics.services.drive_upload_service import DriveUploadService
 from sales_analytics.services.ingestion_service import IngestionService
 from sales_analytics.services.normalization_service import NormalizationService
@@ -78,6 +80,59 @@ class SparseTossPlaceClient(MockTossPlaceClient):
                 "orders": orders,
             }
         ]
+
+
+class RecordingDriveClient(DriveClient):
+    def __init__(self):
+        self.uploaded_count = 0
+
+    def target_period_folder_id(self, merchant: MerchantConfig, period_start: date, period_type: str) -> str:
+        return "drive-folder"
+
+    def upload_period(
+        self,
+        merchant: MerchantConfig,
+        period_start: date,
+        period_type: str,
+        local_path: Path,
+        report_type: str,
+    ) -> UploadedFile:
+        self.uploaded_count += 1
+        return UploadedFile(drive_file_id="drive-file", drive_folder_id="drive-folder")
+
+
+class FakeGoogleDriveRequest:
+    def __init__(self, response):
+        self.response = response
+
+    def execute(self):
+        return self.response
+
+
+class FakeGoogleDriveFiles:
+    def __init__(self, existing_files):
+        self.existing_files = existing_files
+        self.created_count = 0
+        self.updated_count = 0
+
+    def list(self, **kwargs):
+        return FakeGoogleDriveRequest({"files": self.existing_files})
+
+    def create(self, **kwargs):
+        self.created_count += 1
+        return FakeGoogleDriveRequest({"id": "created-file", "parents": ["drive-folder"]})
+
+    def update(self, **kwargs):
+        self.updated_count += 1
+        return FakeGoogleDriveRequest({"id": kwargs["fileId"], "parents": ["drive-folder"]})
+
+
+class FakeGoogleDriveService:
+    def __init__(self, files_api):
+        self.files_api = files_api
+
+    def files(self):
+        return self.files_api
 
 
 class PipelineTest(unittest.TestCase):
@@ -250,6 +305,84 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(order_row["created_at"], "2025-07-01 09:05:16")
             self.assertEqual(order_row["completed_at"], "2025-07-01 09:05:17")
             self.assertEqual(payment_row["approved_at"], "2025-07-01 09:05:17")
+
+    def test_expired_or_revoked_google_oauth_token_is_moved_as_invalid(self) -> None:
+        class ExpiredCredentials:
+            expired = True
+            refresh_token = "refresh-token"
+            valid = False
+
+            def refresh(self, request):
+                raise RefreshError("invalid_grant: Token has been expired or revoked.")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = Path(tmp) / "google_oauth_token.json"
+            token_path.write_text("{}", encoding="utf-8")
+
+            with patch(
+                "sales_analytics.clients.google_drive_client.Credentials.from_authorized_user_file",
+                return_value=ExpiredCredentials(),
+            ):
+                with self.assertRaisesRegex(ValueError, "sign in again"):
+                    load_oauth_credentials(token_path)
+
+            self.assertFalse(token_path.exists())
+            self.assertTrue(token_path.with_name("google_oauth_token.json.invalid").exists())
+
+    def test_google_drive_upload_updates_existing_file_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "monthly_all_payments.csv"
+            path.write_text("a,b\n1,2\n", encoding="utf-8")
+            files_api = FakeGoogleDriveFiles([{"id": "existing-file", "name": path.name, "modifiedTime": "2026-06-30T00:00:00Z"}])
+            client = GoogleDriveApiClient()
+            client.service = FakeGoogleDriveService(files_api)
+
+            uploaded = client._upload_or_update_csv("drive-folder", path)
+
+            self.assertEqual(uploaded.drive_file_id, "existing-file")
+            self.assertEqual(files_api.updated_count, 1)
+            self.assertEqual(files_api.created_count, 0)
+
+    def test_changed_period_report_updates_existing_drive_upload_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{root / 'sales.db'}"
+            init_database(database_url)
+            factory = create_session_factory(database_url)
+            merchant = MerchantConfig(merchant_id=1, merchant_name="Demo Store")
+            client = RecordingDriveClient()
+            upload_service = DriveUploadService(client)
+            report_path = root / "Demo_monthly_all_payments_2026-06.csv"
+            report_path.write_text("amount\n100\n", encoding="utf-8")
+
+            with factory() as session:
+                upload_service.upload_period_files(
+                    session,
+                    "run-1",
+                    merchant,
+                    date(2026, 6, 1),
+                    "monthly",
+                    [ExportedFile("monthly_all_payments", report_path, "checksum-1", report_path.stat().st_size)],
+                )
+                session.commit()
+
+                report_path.write_text("amount\n200\n", encoding="utf-8")
+                upload_service.upload_period_files(
+                    session,
+                    "run-2",
+                    merchant,
+                    date(2026, 6, 1),
+                    "monthly",
+                    [ExportedFile("monthly_all_payments", report_path, "checksum-2", report_path.stat().st_size)],
+                )
+                session.commit()
+
+                uploads = session.scalars(select(DriveUpload)).all()
+
+            self.assertEqual(client.uploaded_count, 2)
+            self.assertEqual(len(uploads), 1)
+            self.assertEqual(uploads[0].run_id, "run-2")
+            self.assertEqual(uploads[0].checksum, "checksum-2")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import shutil
+import time
+import webbrowser
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
 import google.auth
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
@@ -113,10 +116,7 @@ class GoogleDriveApiClient(DriveClient):
         folder_id = self.target_folder_id(merchant, business_date)
         if folder_id is None:
             raise RuntimeError("Google Drive target folder could not be resolved")
-        metadata = {"name": local_path.name, "parents": [folder_id]}
-        media = MediaFileUpload(str(local_path), mimetype="text/csv", resumable=local_path.stat().st_size > 5 * 1024 * 1024)
-        created = self.service.files().create(body=metadata, media_body=media, fields="id, parents").execute()
-        return UploadedFile(drive_file_id=created["id"], drive_folder_id=folder_id)
+        return self._upload_or_update_csv(folder_id, local_path)
 
     def target_folder_id(self, merchant: MerchantConfig, business_date: date) -> str:
         return self._report_folder_id(merchant, business_date)
@@ -132,10 +132,7 @@ class GoogleDriveApiClient(DriveClient):
         folder_id = self.target_period_folder_id(merchant, period_start, period_type)
         if folder_id is None:
             raise RuntimeError("Google Drive target period folder could not be resolved")
-        metadata = {"name": local_path.name, "parents": [folder_id]}
-        media = MediaFileUpload(str(local_path), mimetype="text/csv", resumable=local_path.stat().st_size > 5 * 1024 * 1024)
-        created = self.service.files().create(body=metadata, media_body=media, fields="id, parents").execute()
-        return UploadedFile(drive_file_id=created["id"], drive_folder_id=folder_id)
+        return self._upload_or_update_csv(folder_id, local_path)
 
     def target_period_folder_id(self, merchant: MerchantConfig, period_start: date, period_type: str) -> str:
         return self._period_folder_id(merchant, period_start, period_type)
@@ -185,6 +182,48 @@ class GoogleDriveApiClient(DriveClient):
         created = self.service.files().create(body=metadata, fields="id").execute()
         return created["id"]
 
+    def _upload_or_update_csv(self, folder_id: str, local_path: Path) -> UploadedFile:
+        media = MediaFileUpload(str(local_path), mimetype="text/csv", resumable=local_path.stat().st_size > 5 * 1024 * 1024)
+        existing_file_id = self._find_file_id(folder_id, local_path.name)
+        if existing_file_id:
+            updated = (
+                self.service.files()
+                .update(
+                    fileId=existing_file_id,
+                    body={"name": local_path.name},
+                    media_body=media,
+                    fields="id, parents",
+                )
+                .execute()
+            )
+            return UploadedFile(drive_file_id=updated["id"], drive_folder_id=folder_id)
+        metadata = {"name": local_path.name, "parents": [folder_id]}
+        created = self.service.files().create(body=metadata, media_body=media, fields="id, parents").execute()
+        return UploadedFile(drive_file_id=created["id"], drive_folder_id=folder_id)
+
+    def _find_file_id(self, folder_id: str, name: str) -> str | None:
+        escaped_name = name.replace("\\", "\\\\").replace("'", "\\'")
+        query = (
+            f"name = '{escaped_name}' "
+            f"and '{folder_id}' in parents "
+            "and trashed = false"
+        )
+        result = (
+            self.service.files()
+            .list(
+                q=query,
+                spaces="drive",
+                fields="files(id, name, modifiedTime)",
+                pageSize=1,
+                orderBy="modifiedTime desc",
+            )
+            .execute()
+        )
+        files = result.get("files", [])
+        if not files:
+            return None
+        return files[0]["id"]
+
 
 class GoogleDriveClient(GoogleDriveApiClient):
     def __init__(self, credentials_file: str):
@@ -195,6 +234,8 @@ class GoogleDriveClient(GoogleDriveApiClient):
 class GoogleOAuthDriveClient(GoogleDriveApiClient):
     def __init__(self, token_file: Path, client_secrets_file: str = "", auto_auth: bool = False):
         if auto_auth and not token_file.exists():
+            if _running_in_container():
+                raise ValueError(_missing_oauth_token_message(token_file))
             create_oauth_token(client_secrets_file, token_file)
         credentials = load_oauth_credentials(token_file)
         self.service = build("drive", "v3", credentials=credentials, cache_discovery=False)
@@ -216,24 +257,68 @@ def create_oauth_token(client_secrets_file: str, token_file: Path, host: str = "
         raise ValueError(f"Google OAuth client secrets file not found: {client_secrets_file}")
     token_file.parent.mkdir(parents=True, exist_ok=True)
     flow = InstalledAppFlow.from_client_secrets_file(client_secrets_file, DRIVE_SCOPES)
-    credentials = flow.run_local_server(host=host, port=port, prompt="consent", access_type="offline")
+    try:
+        credentials = flow.run_local_server(host=host, port=port, prompt="consent", access_type="offline")
+    except webbrowser.Error as exc:
+        raise ValueError(
+            "Google OAuth browser login could not be opened in this environment. "
+            "Run `uv run sales-analytics auth-google` on your local machine, then mount the generated token file into Docker."
+        ) from exc
     token_file.write_text(credentials.to_json(), encoding="utf-8")
     return token_file
 
 
 def load_oauth_credentials(token_file: Path) -> Credentials:
     if not token_file.exists():
-        raise ValueError(
-            f"OAuth token file not found: {token_file}. "
-            "Run `sales-analytics auth-google` locally first, then mount the token file into Docker."
-        )
+        raise ValueError(_missing_oauth_token_message(token_file))
     credentials = Credentials.from_authorized_user_file(str(token_file), DRIVE_SCOPES)
-    if credentials.expired and credentials.refresh_token:
-        credentials.refresh(Request())
-        token_file.write_text(credentials.to_json(), encoding="utf-8")
+    try:
+        if credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+            token_file.write_text(credentials.to_json(), encoding="utf-8")
+    except RefreshError as exc:
+        invalid_path = move_invalid_oauth_token(token_file)
+        raise ValueError(_reauth_required_message(token_file, invalid_path)) from exc
     if not credentials.valid:
-        raise ValueError("OAuth credentials are invalid. Re-run `sales-analytics auth-google`.")
+        invalid_path = move_invalid_oauth_token(token_file)
+        raise ValueError(_reauth_required_message(token_file, invalid_path))
     return credentials
+
+
+def move_invalid_oauth_token(token_file: Path) -> Path:
+    invalid_path = _available_invalid_token_path(token_file)
+    try:
+        token_file.replace(invalid_path)
+    except OSError:
+        return token_file
+    return invalid_path
+
+
+def _available_invalid_token_path(token_file: Path) -> Path:
+    invalid_path = token_file.with_name(f"{token_file.name}.invalid")
+    if not invalid_path.exists():
+        return invalid_path
+    return token_file.with_name(f"{token_file.name}.invalid-{int(time.time())}")
+
+
+def _reauth_required_message(token_file: Path, invalid_path: Path) -> str:
+    return (
+        "Google OAuth token has expired, been revoked, or is invalid. "
+        f"The existing token was moved to {invalid_path}. "
+        f"Run `uv run sales-analytics auth-google --token-file {token_file}` locally to sign in again, "
+        "then restart the Docker container with the same data volume mounted."
+    )
+
+
+def _missing_oauth_token_message(token_file: Path) -> str:
+    return (
+        f"OAuth token file not found: {token_file}. "
+        "Run `uv run sales-analytics auth-google` locally first, then mount the token file into Docker."
+    )
+
+
+def _running_in_container() -> bool:
+    return Path("/.dockerenv").exists()
 
 
 def build_drive_client(settings: Settings) -> DriveClient:

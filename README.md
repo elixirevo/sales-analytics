@@ -187,7 +187,17 @@ docker run --rm --env-file .env \
   -v "$PWD/data:/app/data" \
   -v "$PWD/reports:/app/reports" \
   -v "$PWD/uploads:/app/uploads" \
+  -v "$PWD/secrets:/app/secrets" \
   sales-analytics:latest run
+```
+
+OAuth 토큰이 만료되었거나 Google 계정에서 앱 권한을 해제한 경우 앱은 기존 토큰을
+`data/google_oauth_token.json.invalid`로 이동하고 중단합니다. 이때 로컬에서 다시 로그인해 새 토큰을 만든 뒤
+컨테이너를 재시작합니다.
+
+```bash
+uv run sales-analytics auth-google
+docker restart sales-analytics-server
 ```
 
 `MERCHANTS_JSON`의 `drive_folder_id`에 업로드 대상 Drive 폴더 ID를 넣으면 해당 폴더로 업로드합니다. 비워두면 내 Drive 기본 위치로 생성합니다.
